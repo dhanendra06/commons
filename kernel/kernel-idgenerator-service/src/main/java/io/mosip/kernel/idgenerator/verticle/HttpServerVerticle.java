@@ -107,15 +107,13 @@ public class HttpServerVerticle extends AbstractVerticle {
 	}
 
 	private void addAccessLogHandler(final RoutingContext context, AccessLogHandler accessLogHandler) {
-
 		long startMillis = System.currentTimeMillis();
-
 		context.addBodyEndHandler(x -> accessLogHandler.log(context, startMillis));
-
 		context.next();
-
 	}
-
 	
-
+	@Override
+	public void stop() {
+	    LOGGER.info("Shutting down HttpServerVerticle...");
+	}
 }

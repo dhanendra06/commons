@@ -221,7 +221,6 @@ public class UinFilterUtil {
 	 * @param digitsGroupLimit digitsGroupLimit
 	 * @return true if filter matches
 	 */
-
 	private boolean firstAndLastDigitsValidation(String id, int digitsGroupLimit) {
 		return (id.substring(0, digitsGroupLimit).equals(id.substring(id.length() - digitsGroupLimit, id.length())));
 	}
@@ -240,7 +239,6 @@ public class UinFilterUtil {
 					return true;
 
 				}
-
 			}
 		}
 		return false;
@@ -266,7 +264,6 @@ public class UinFilterUtil {
 	 * 
 	 */
 	private boolean restrictedCyclicNumFilter(String id) {
-
 		List<String> cyclicNumList = new ArrayList<>();
 		cyclicNumList.add(CYCLIC_NUM[0]);// (6 digit)
 		cyclicNumList.add(CYCLIC_NUM[1]);// (16 digit)

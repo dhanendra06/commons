@@ -53,5 +53,4 @@ public class UinEntityAssigned extends BaseEntity {
 		this.uin = uinEntity.getUin();
 		this.status = uinEntity.getStatus();
 	}
-
 }

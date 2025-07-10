@@ -40,5 +40,4 @@ public class UinEntity extends BaseEntity {
 	// @Column(name = "is_used")
 	@Column(name = "uin_status", nullable = false, length = 16)
 	private String status;
-
 }

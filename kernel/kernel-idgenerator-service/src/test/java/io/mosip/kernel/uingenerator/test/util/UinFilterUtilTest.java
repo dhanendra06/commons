@@ -9,6 +9,7 @@ import java.lang.reflect.Method;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.test.annotation.DirtiesContext;
@@ -77,6 +78,7 @@ public class UinFilterUtilTest {
 	private UinFilterUtil uinFilterUtils;
 
 	@MockBean
+	@Qualifier("restTemplate")
 	private RestTemplate restTemplate;
 
 	@MockBean

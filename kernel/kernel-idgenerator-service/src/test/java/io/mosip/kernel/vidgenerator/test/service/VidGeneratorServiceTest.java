@@ -22,6 +22,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Captor;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.dao.DataRetrievalFailureException;
@@ -70,6 +71,7 @@ public class VidGeneratorServiceTest {
 	private VertxAuthenticationProvider authHandler;
 
 	@MockBean
+	@Qualifier("restTemplate")
 	private RestTemplate restTemplate;
 
 	private List<VidAssignedEntity> expiredButAssignedStatusVAEntities;

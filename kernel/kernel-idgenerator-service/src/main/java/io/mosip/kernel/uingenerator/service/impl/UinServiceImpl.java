@@ -3,7 +3,6 @@
  */
 package io.mosip.kernel.uingenerator.service.impl;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -30,7 +29,6 @@ import io.mosip.kernel.uingenerator.util.UINMetaDataUtil;
 import io.vertx.core.logging.Logger;
 import io.vertx.core.logging.LoggerFactory;
 import io.vertx.ext.web.RoutingContext;
-import org.springframework.beans.factory.annotation.Value;
 
 /**
  * @author Dharmesh Khandelwal
@@ -49,7 +47,7 @@ public class UinServiceImpl implements UinService {
 	 */
 	@Autowired
 	private UinRepository uinRepository;
-	
+
 	@Autowired
 	private UinRepositoryAssigned uinRepositoryAssigned;
 
@@ -58,12 +56,9 @@ public class UinServiceImpl implements UinService {
 	 */
 	@Autowired
 	private UINMetaDataUtil metaDataUtil;
-	
+
 	@Autowired
 	private VertxAuthenticationProvider authHandler;
-	
-	@Value("${mosip.kernel.uin.page.size:50000}")
-	private int pageSize;
 
 	/*
 	 * (non-Javadoc)
@@ -73,20 +68,20 @@ public class UinServiceImpl implements UinService {
 	@Transactional
 	@Override
 	public UinResponseDto getUin(RoutingContext routingContext) {
-		UinResponseDto uinResponseDto = new UinResponseDto();
-		UinEntity uinBean = uinRepository.findFirstByStatus(UinGeneratorConstant.UNUSED);
-		if (uinBean != null) {
-			uinRepository.updateStatus(UinGeneratorConstant.ISSUED, authHandler.getContextUser(routingContext),
-					DateUtils.getUTCCurrentDateTime(), uinBean.getUin());
-			uinResponseDto.setUin(uinBean.getUin());
-		} else {
-			throw new UinNotFoundException(UinGeneratorErrorCode.UIN_NOT_FOUND.getErrorCode(),
-					UinGeneratorErrorCode.UIN_NOT_FOUND.getErrorMessage());
-		}
-		return uinResponseDto;
-	}
+		UinEntity uinBean = Optional.ofNullable(uinRepository.findFirstByStatus(UinGeneratorConstant.UNUSED))
+				.orElseThrow(() -> new UinNotFoundException(UinGeneratorErrorCode.UIN_NOT_FOUND.getErrorCode(),
+						UinGeneratorErrorCode.UIN_NOT_FOUND.getErrorMessage()));
 
-	
+		String user = authHandler.getContextUser(routingContext);
+		uinRepository.updateStatus(UinGeneratorConstant.ISSUED, user, DateUtils.getUTCCurrentDateTime(),
+				uinBean.getUin());
+
+		// LOGGER.info("Issued UIN {} to user {}", uinBean.getUin(), user);
+
+		UinResponseDto response = new UinResponseDto();
+		response.setUin(uinBean.getUin());
+		return response;
+	}
 
 	/*
 	 * (non-Javadoc)
@@ -97,53 +92,70 @@ public class UinServiceImpl implements UinService {
 	 */
 	@Override
 	public UinStatusUpdateReponseDto updateUinStatus(UinEntity uinAck, RoutingContext routingContext) {
-		UinStatusUpdateReponseDto uinResponseDto = new UinStatusUpdateReponseDto();
-		UinEntity existingUin = uinRepository.findByUin(uinAck.getUin());
-		if (existingUin != null) {
-			if (UinGeneratorConstant.ISSUED.equals(existingUin.getStatus())) {
-				metaDataUtil.setUpdateMetaData(existingUin, routingContext);
-				if (UinGeneratorConstant.ASSIGNED.equals(uinAck.getStatus())) {
-					existingUin.setStatus(UinGeneratorConstant.ASSIGNED);
-					uinRepository.save(existingUin);
-				} else if (UinGeneratorConstant.UNASSIGNED.equals(uinAck.getStatus())) {
-					existingUin.setStatus(UinGeneratorConstant.UNUSED);
-					uinRepository.save(existingUin);
-				} else {
-					throw new UinStatusNotFoundException(UinGeneratorErrorCode.UIN_STATUS_NOT_FOUND.getErrorCode(),
-							UinGeneratorErrorCode.UIN_STATUS_NOT_FOUND.getErrorMessage());
-				}
-			} else {
-				throw new UinNotIssuedException(UinGeneratorErrorCode.UIN_NOT_ISSUED.getErrorCode(),
-						UinGeneratorErrorCode.UIN_NOT_ISSUED.getErrorMessage());
-			}
-		} else {
-			throw new UinNotFoundException(UinGeneratorErrorCode.UIN_NOT_FOUND.getErrorCode(),
-					UinGeneratorErrorCode.UIN_NOT_FOUND.getErrorMessage());
+		UinEntity existingUin = Optional.ofNullable(uinRepository.findByUin(uinAck.getUin()))
+				.orElseThrow(() -> new UinNotFoundException(UinGeneratorErrorCode.UIN_NOT_FOUND.getErrorCode(),
+						UinGeneratorErrorCode.UIN_NOT_FOUND.getErrorMessage()));
+
+		if (!UinGeneratorConstant.ISSUED.equals(existingUin.getStatus())) {
+			throw new UinNotIssuedException(UinGeneratorErrorCode.UIN_NOT_ISSUED.getErrorCode(),
+					UinGeneratorErrorCode.UIN_NOT_ISSUED.getErrorMessage());
 		}
-		uinResponseDto.setUin(existingUin.getUin());
-		uinResponseDto.setStatus(existingUin.getStatus());
-		return uinResponseDto;
+
+		metaDataUtil.setUpdateMetaData(existingUin, routingContext);
+
+		switch (uinAck.getStatus()) {
+		case UinGeneratorConstant.ASSIGNED:
+			existingUin.setStatus(UinGeneratorConstant.ASSIGNED);
+			break;
+		case UinGeneratorConstant.UNASSIGNED:
+			existingUin.setStatus(UinGeneratorConstant.UNUSED);
+			break;
+		default:
+			throw new UinStatusNotFoundException(UinGeneratorErrorCode.UIN_STATUS_NOT_FOUND.getErrorCode(),
+					UinGeneratorErrorCode.UIN_STATUS_NOT_FOUND.getErrorMessage());
+		}
+
+		uinRepository.save(existingUin);
+		// LOGGER.info("Updated UIN {} status to {}", existingUin.getUin(),
+		// existingUin.getStatus());
+
+		UinStatusUpdateReponseDto responseDto = new UinStatusUpdateReponseDto();
+		responseDto.setUin(existingUin.getUin());
+		responseDto.setStatus(existingUin.getStatus());
+		return responseDto;
 	}
 
 	@Transactional(transactionManager = "transactionManager")
 	@Override
 	public void transferUin() {
-		List<UinEntity> uinEntities=uinRepository.findByStatus(UinGeneratorConstant.ISSUED, pageSize);
-		List<UinEntityAssigned> uinEntitiesAssined = convertUinEntitiesListToUinEntitiesAssignedList(uinEntities);
-		uinRepositoryAssigned.saveAll(uinEntitiesAssined);
-	    uinRepository.deleteAll(uinEntities);
+		List<UinEntity> uinEntities = uinRepository.findByStatus(UinGeneratorConstant.ASSIGNED);
+
+		if (uinEntities.isEmpty()) {
+			LOGGER.info("No ASSIGNED UINs to transfer.");
+			return;
+		}
+
+		List<UinEntityAssigned> assignedList = convertToAssignedList(uinEntities);
+		uinRepositoryAssigned.saveAll(assignedList);
+		uinRepository.deleteAll(uinEntities);
+
+		// LOGGER.info("Transferred {} UINs to assigned table and deleted from main
+		// pool.", uinEntities.size());
 	}
 
 	private List<UinEntityAssigned> convertUinEntitiesListToUinEntitiesAssignedList(List<UinEntity> uinEntities) {
-		return uinEntities.stream()
-				.map(UinEntityAssigned::new)
-				.collect(Collectors.toList());
+		return uinEntities.stream().map(UinEntityAssigned::new).collect(Collectors.toList());
 	}
 
 	@Override
-	public boolean uinExist(String uin) {
-	Optional<UinEntityAssigned> uinEntityAssignedOptional=uinRepositoryAssigned.findById(uin);
-	return uinEntityAssignedOptional.isPresent();
+    public boolean uinExist(String uin) {
+        return uinRepositoryAssigned.findById(uin).isPresent();
+    }
+
+	/**
+	 * Converts UinEntity list to UinEntityAssigned list.
+	 */
+	private List<UinEntityAssigned> convertToAssignedList(List<UinEntity> uinEntities) {
+		return uinEntities.stream().map(UinEntityAssigned::new).collect(Collectors.toList());
 	}
-	
 }
