@@ -163,6 +163,8 @@ public class HibernateDaoConfig implements EnvironmentAware {
 				HibernatePersistenceConstant.JTA);
 		getProperty(jpaProperties, HibernatePersistenceConstant.HIBERNATE_EJB_INTERCEPTOR,
 				HibernatePersistenceConstant.EMPTY_INTERCEPTOR);
+		jpaProperties.put("hibernate.jdbc.batch_size", "500");
+		jpaProperties.put("hibernate.order_inserts", "true");
 		return jpaProperties;
 	}
 

@@ -264,6 +264,49 @@ public class VidServiceImpl implements VidService {
 	}
 
 	@Override
+	@Transactional(transactionManager = "transactionManager")
+	public int saveAllVIDs(List<VidEntity> vids) {
+		if (!bloomFilterReady.get()) {
+			try {
+				boolean completed = bloomFilterLatch.await(120, TimeUnit.SECONDS);
+				if (!completed) {
+					LOGGER.warn("VID Bloom filter init timed out after 120s; falling back to DB checks");
+				}
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				LOGGER.error("Interrupted while waiting for VID Bloom filter", e);
+			}
+		}
+
+		List<VidEntity> toInsert;
+		if (bloomFilterReady.get()) {
+			toInsert = vids.stream()
+					.filter(v -> !vidBloomFilter.mightContain(v.getVid()))
+					.collect(Collectors.toList());
+		} else {
+			toInsert = vids.stream()
+					.filter(v -> !vidRepository.existsById(v.getVid()) && !vidAssignedRepository.existsById(v.getVid()))
+					.collect(Collectors.toList());
+		}
+
+		if (toInsert.isEmpty()) return 0;
+
+		try {
+			vidRepository.saveAll(toInsert);
+			if (bloomFilterReady.get()) {
+				toInsert.forEach(v -> vidBloomFilter.put(v.getVid()));
+			}
+			return toInsert.size();
+		} catch (DataAccessException exception) {
+			LOGGER.error(ExceptionUtils.parseException(exception));
+			return 0;
+		} catch (Exception exception) {
+			LOGGER.error(ExceptionUtils.parseException(exception));
+			return 0;
+		}
+	}
+
+	@Override
 	public boolean saveVID(VidEntity vid) {
 		// Wait for Bloom filter only if not yet ready (happens only on the very first
 		// call during startup, if pool population fires before init completes).

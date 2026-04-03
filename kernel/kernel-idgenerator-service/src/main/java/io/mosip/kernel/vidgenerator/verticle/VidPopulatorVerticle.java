@@ -14,6 +14,8 @@ import io.vertx.core.Future;
 import io.vertx.core.logging.Logger;
 import io.vertx.core.logging.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 public class VidPopulatorVerticle extends AbstractVerticle {
@@ -50,17 +52,19 @@ public class VidPopulatorVerticle extends AbstractVerticle {
 			// Blocking the event loop delays health-check responses and can trigger
 			// Kubernetes liveness probe failures → pod restart.
 			vertx.executeBlocking(future -> {
+				final int batchSize = 500;
 				long count = 0;
 				while (count < noOfVidsToGenerate) {
-					String vid = vidGenerator.generateId();
-					VidEntity entity = new VidEntity();
-					entity.setVid(vid);
-					entity.setStatus(VidLifecycleStatus.AVAILABLE);
-					metaDataUtil.setCreateMetaData(entity);
-					boolean isPersisted = vidWriter.persistVids(entity);
-					if (isPersisted) {
-						count++;
+					List<VidEntity> batch = new ArrayList<>(batchSize);
+					for (int i = 0; i < batchSize; i++) {
+						String vid = vidGenerator.generateId();
+						VidEntity entity = new VidEntity();
+						entity.setVid(vid);
+						entity.setStatus(VidLifecycleStatus.AVAILABLE);
+						metaDataUtil.setCreateMetaData(entity);
+						batch.add(entity);
 					}
+					count += vidWriter.persistBatch(batch);
 				}
 				LOGGER.info("No of vids persisted are {}", count);
 				future.complete(count);
