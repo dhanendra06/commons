@@ -45,21 +45,33 @@ public class VidPopulatorVerticle extends AbstractVerticle {
 			long noOfFreeVids = Long.parseLong(handler.body().toString());
 			long noOfVidsToGenerate = vidToGenerate - noOfFreeVids;
 			LOGGER.info("Persisting {} vids in pool", noOfVidsToGenerate);
-			long count = 0;
-			while (count < vidToGenerate) {
-				String vid = vidGenerator.generateId();
-				VidEntity entity = new VidEntity();
-				entity.setVid(vid);
-				entity.setStatus(VidLifecycleStatus.AVAILABLE);
-				metaDataUtil.setCreateMetaData(entity);
-				boolean isPersisted = vidWriter.persistVids(entity);
-				if (isPersisted) {
-					count++;
-				}
-			}
-			handler.reply("pool population successfull");
 
-			LOGGER.info("No of vids persisted are {}", count);
+			// Run on a worker thread — never block the Vert.x event loop.
+			// Blocking the event loop delays health-check responses and can trigger
+			// Kubernetes liveness probe failures → pod restart.
+			vertx.executeBlocking(future -> {
+				long count = 0;
+				while (count < noOfVidsToGenerate) {
+					String vid = vidGenerator.generateId();
+					VidEntity entity = new VidEntity();
+					entity.setVid(vid);
+					entity.setStatus(VidLifecycleStatus.AVAILABLE);
+					metaDataUtil.setCreateMetaData(entity);
+					boolean isPersisted = vidWriter.persistVids(entity);
+					if (isPersisted) {
+						count++;
+					}
+				}
+				LOGGER.info("No of vids persisted are {}", count);
+				future.complete(count);
+			}, result -> {
+				if (result.succeeded()) {
+					handler.reply("pool population successfull");
+				} else {
+					LOGGER.error("VID pool population failed", result.cause());
+					handler.fail(500, result.cause() != null ? result.cause().getMessage() : "VID generation failed");
+				}
+			});
 		});
 	}
 }

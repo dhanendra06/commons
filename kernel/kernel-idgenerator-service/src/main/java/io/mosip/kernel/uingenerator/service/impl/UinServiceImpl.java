@@ -5,7 +5,6 @@ package io.mosip.kernel.uingenerator.service.impl;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.stream.Collectors;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -142,8 +141,7 @@ public class UinServiceImpl implements UinService {
 
 	@Override
 	public boolean uinExist(String uin) {
-	Optional<UinEntityAssigned> uinEntityAssignedOptional=uinRepositoryAssigned.findById(uin);
-	return uinEntityAssignedOptional.isPresent();
+		return uinRepository.existsById(uin) || uinRepositoryAssigned.existsById(uin);
 	}
 	
 }
