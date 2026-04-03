@@ -77,7 +77,7 @@ public class HttpServerVerticle extends AbstractVerticle {
 				new ObjectMapper(), environment);
 		healthCheckRouter.get(UinGeneratorConstant.HEALTH_ENDPOINT)
 				.handler(healthCheckHandler);
-		long healthcheckertime= Long.parseLong(environment.getProperty(VIDGeneratorConstant.UIN_HEALTH_CHECKER));
+		long healthcheckertime= Long.parseLong(environment.getProperty(VIDGeneratorConstant.UIN_HEALTH_CHECKER, "3000"));
 		healthCheckHandler.register("db", healthcheckertime, healthCheckHandler::databaseHealthChecker);
 		healthCheckHandler.register("diskspace", healthcheckertime, healthCheckHandler::dispSpaceHealthChecker);
 		healthCheckHandler.register("idgenerator", healthcheckertime, f -> healthCheckHandler.verticleHealthHandler(f, vertx));
