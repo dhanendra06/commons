@@ -1,16 +1,29 @@
 package io.mosip.kernel.uingenerator.generator;
 
-import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import jakarta.annotation.PostConstruct;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityManagerFactory;
+import jakarta.persistence.EntityTransaction;
+import jakarta.persistence.PersistenceException;
 
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.stereotype.Component;
+
+import com.google.common.hash.BloomFilter;
+import com.google.common.hash.Funnels;
 
 import io.mosip.kernel.core.idgenerator.spi.UinGenerator;
 import io.mosip.kernel.core.util.ChecksumUtils;
@@ -24,84 +37,44 @@ import io.vertx.core.logging.LoggerFactory;
 
 /**
  * This class generates a list of uins
- * 
+ *
  * @author Dharmesh Khandelwal
  * @since 1.0.0
- *
  */
 @Component
 public class UinGeneratorImpl implements UinGenerator {
-	/**
-	 * instance of {@link UinFilterUtil}
-	 */
+
 	@Autowired
 	private UinFilterUtil uinFilterUtils;
 
-	/**
-	 * instance of {@link UINMetaDataUtil}
-	 */
 	@Autowired
 	private UINMetaDataUtil metaDataUtil;
 
 	@Autowired
 	private UinService uinService;
 
-	/**
-	 * Field for UinWriter
-	 */
 	@Autowired
 	private UinWriter uinWriter;
 
-	/**
-	 * The logger instance
-	 */
+	@Autowired
+	private EntityManagerFactory entityManagerFactory;
+
 	private static final Logger LOGGER = LoggerFactory.getLogger(UinGeneratorImpl.class);
 
-	/**
-	 * Field for number of uins to generate
-	 */
 	private final long uinsCount;
-
-	/**
-	 * The length of the uin
-	 */
 	private final int uinLength;
-
-	/**
-	 * The uin default status
-	 */
 	private final String uinDefaultStatus;
+
 	private SecureRandom random;
 
 	@Value("${mosip.idgen.uin.secure-random-reinit-frequency:45}")
 	private int reInitSecureRandomFrequency;
 
-	@PostConstruct
-	private void init() {
-		ThreadPoolTaskScheduler taskScheduler = new ThreadPoolTaskScheduler();
-		taskScheduler.setPoolSize(1);
-		taskScheduler.initialize();
-		taskScheduler.scheduleAtFixedRate(new ReInitSecureRandomTask(),
-				TimeUnit.MINUTES.toMillis(reInitSecureRandomFrequency));
-	}
+	// Bloom filter state — initialized ONCE at startup, never rebuilt
+	private volatile BloomFilter<CharSequence> uinBloomFilter;
+	private final AtomicBoolean bloomFilterReady = new AtomicBoolean(false);
+	private final CountDownLatch bloomFilterLatch = new CountDownLatch(1);
 
-	private class ReInitSecureRandomTask implements Runnable {
-
-		public void run() {
-			initializeSecureRandom();
-		}
-	}
-
-	private void initializeSecureRandom() {
-		random = new SecureRandom();
-	}
-
-	/**
-	 * Constructor to set {@link #uinsCount} and {@link #uinLength}
-	 * 
-	 * @param uinsCount The number of uins to generate
-	 * @param uinLength The length of the uin
-	 */
 	public UinGeneratorImpl(@Value("${mosip.kernel.uin.uins-to-generate}") long uinsCount,
 			@Value("${mosip.kernel.uin.length}") int uinLength) {
 		this.uinsCount = uinsCount;
@@ -109,16 +82,161 @@ public class UinGeneratorImpl implements UinGenerator {
 		this.uinDefaultStatus = UinGeneratorConstant.UNUSED;
 	}
 
-	// private static final RandomDataGenerator RANDOM_DATA_GENERATOR = new
-	// RandomDataGenerator();
+	@PostConstruct
+	private void init() {
+		// SecureRandom periodic re-init scheduler
+		ThreadPoolTaskScheduler taskScheduler = new ThreadPoolTaskScheduler();
+		taskScheduler.setPoolSize(1);
+		taskScheduler.initialize();
+		taskScheduler.scheduleAtFixedRate(this::initializeSecureRandom,
+				TimeUnit.MINUTES.toMillis(reInitSecureRandomFrequency));
 
-	/*
-	 * (non-Javadoc)
-	 * 
-	 * @see io.mosip.kernel.core.spi.idgenerator.IdGenerator#generateId()
+		// Initialize Bloom filter in background so pod startup is non-blocking.
+		// Health probes pass immediately; generateId() will wait only if the first
+		// scheduler tick fires before initialization completes (rare in practice).
+		Thread bloomInitThread = new Thread(this::initializeBloomFilter, "bloom-filter-init");
+		bloomInitThread.setDaemon(true);
+		bloomInitThread.start();
+	}
+
+	private void initializeSecureRandom() {
+		random = new SecureRandom();
+	}
+
+	/**
+	 * Called ONCE from the background init thread. Loads all existing UINs from DB
+	 * into the Bloom filter. Never called again — generateId() updates the filter
+	 * incrementally via bloomFilter.put() after each insert.
 	 */
+	private void initializeBloomFilter() {
+		try {
+			long existingCount = getExistingUinCountFromDB();
+			long capacity = Math.max(existingCount + uinsCount, 100_000L);
+
+			LOGGER.info("Initializing Bloom filter with capacity={}, existing UINs in DB={}", capacity, existingCount);
+
+			BloomFilter<CharSequence> filter = BloomFilter.create(
+					Funnels.stringFunnel(StandardCharsets.UTF_8),
+					capacity,
+					0.001);
+
+			EntityManager em = entityManagerFactory.createEntityManager();
+			try {
+				int batchSize = 10_000;
+				int offset = 0;
+				while (true) {
+					List<String> uins = em
+							.createQuery("SELECT u.uin FROM UinEntity u", String.class)
+							.setFirstResult(offset)
+							.setMaxResults(batchSize)
+							.getResultList();
+					if (uins.isEmpty()) break;
+					uins.forEach(filter::put);
+					offset += uins.size();
+					LOGGER.info("Bloom filter loaded {} / {} UINs", offset, existingCount);
+				}
+			} finally {
+				em.close();
+			}
+
+			// Publish atomically — generateId() either sees null (waits) or the fully
+			// loaded filter. No partial state is ever visible.
+			uinBloomFilter = filter;
+			bloomFilterReady.set(true);
+			bloomFilterLatch.countDown();
+			LOGGER.info("Bloom filter ready. Total UINs loaded: {}", existingCount);
+
+		} catch (Exception e) {
+			LOGGER.error("Bloom filter initialization failed", e);
+			// Release latch so generateId() doesn't hang; it will fall back to DB check.
+			bloomFilterLatch.countDown();
+		}
+	}
+
+	private long getExistingUinCountFromDB() {
+		EntityManager em = entityManagerFactory.createEntityManager();
+		try {
+			return em.createQuery("SELECT COUNT(u) FROM UinEntity u", Long.class).getSingleResult();
+		} finally {
+			em.close();
+		}
+	}
+
 	@Override
 	public void generateId(long noOfUINToGenerate) {
+		if (noOfUINToGenerate <= 0) return;
+
+		// Wait for Bloom filter to be ready (only blocks on the very first call if
+		// pod startup init hasn't finished yet — typically a sub-second wait).
+		if (!bloomFilterReady.get()) {
+			LOGGER.info("Waiting for Bloom filter initialization to complete...");
+			try {
+				boolean completed = bloomFilterLatch.await(120, TimeUnit.SECONDS);
+				if (!completed) {
+					LOGGER.warn("UIN Bloom filter init timed out after 120s; falling back to legacy path");
+				}
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				LOGGER.error("Interrupted while waiting for Bloom filter", e);
+				return;
+			}
+		}
+
+		// If init failed, bloomFilterReady is still false — fall back to legacy path.
+		if (!bloomFilterReady.get()) {
+			LOGGER.warn("Bloom filter unavailable; falling back to DB-based duplicate check");
+			generateIdLegacy(noOfUINToGenerate);
+			return;
+		}
+
+		LOGGER.info("Starting UIN generation: requested={}", noOfUINToGenerate);
+		long startTime = System.nanoTime();
+
+		int generatedIdLength = uinLength - 1;
+		long upperBound = Long.parseLong(StringUtils.repeat(UinGeneratorConstant.NINE, generatedIdLength));
+		long lowerBound = Long.parseLong(StringUtils.repeat(UinGeneratorConstant.ZERO, generatedIdLength));
+
+		int batchSize = 5_000;
+		EntityManager em = entityManagerFactory.createEntityManager();
+		try {
+			long count = 0;
+			List<UinEntity> batch = new ArrayList<>(batchSize);
+
+			while (count < noOfUINToGenerate) {
+				String uin = generateSingleId(generatedIdLength, lowerBound, upperBound);
+
+				// Bloom filter check: cheap probabilistic gate (0.1% false positive rate).
+				// A false positive means we skip a valid UIN — acceptable and safe.
+				// A false negative is impossible by design, so no real duplicate reaches DB.
+				if (!uinBloomFilter.mightContain(uin) && uinFilterUtils.isValidId(uin)) {
+					uinBloomFilter.put(uin); // update immediately to prevent intra-batch duplicates
+
+					UinEntity entity = new UinEntity(uin, uinDefaultStatus);
+					metaDataUtil.setCreateMetaData(entity);
+					batch.add(entity);
+
+					if (batch.size() >= batchSize || (count + batch.size()) >= noOfUINToGenerate) {
+						int inserted = insertBatch(em, batch);
+						count += inserted;
+						batch.clear();
+					}
+				}
+			}
+		} catch (Exception e) {
+			LOGGER.error("UIN generation failed", e);
+		} finally {
+			em.close();
+		}
+
+		long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+		LOGGER.info("Generated {} UINs in {} ms (~{} s)", noOfUINToGenerate, durationMs, durationMs / 1000);
+	}
+
+	/**
+	 * Legacy path used only when Bloom filter initialization fails.
+	 * Identical to the original implementation — DB checked per UIN.
+	 */
+	private void generateIdLegacy(long noOfUINToGenerate) {
 		int generatedIdLength = uinLength - 1;
 		long uinCount = 0;
 		long upperBound = Long.parseLong(StringUtils.repeat(UinGeneratorConstant.NINE, generatedIdLength));
@@ -129,49 +247,78 @@ public class UinGeneratorImpl implements UinGenerator {
 			if (uinFilterUtils.isValidId(generatedUIN) && !uinService.uinExist(generatedUIN)) {
 				UinEntity uinBean = new UinEntity(generatedUIN, uinDefaultStatus);
 				metaDataUtil.setCreateMetaData(uinBean);
-				// try {
 				uinWriter.persistUin(uinBean);
 				uinCount++;
-				/*
-				 * } catch (Exception e) { //Skinping on PK violation e.printStackTrace(); }
-				 */
 			}
 		}
 		uinWriter.closeSession();
-		LOGGER.info("Generated {} uins ", uinsCount);
+		LOGGER.info("Generated {} uins (legacy path)", noOfUINToGenerate);
 	}
 
-	/**
-	 * Generates a id and then generate checksum
-	 * 
-	 * @param generatedIdLength The length of id to generate
-	 * @param lowerBound        The lowerbound for generating id
-	 * @param upperBound        The upperbound for generating id
-	 * @return the uin with checksum
-	 */
 	private String generateSingleId(int generatedIdLength, long lowerBound, long upperBound) {
-		byte[] randomSeedBytes = new byte[generatedIdLength];
-		if(random==null) {
+		if (random == null) {
 			initializeSecureRandom();
 		}
-		random.nextBytes(randomSeedBytes);
-		String generatedID = new BigInteger(randomSeedBytes).abs().toString().substring(0, generatedIdLength);
-		String verhoeffDigit = ChecksumUtils.generateChecksumDigit(String.valueOf(generatedID));
-		return appendChecksum(generatedIdLength, generatedID, verhoeffDigit);
+		long range = upperBound - lowerBound + 1;
+		long randomNumber = (Math.abs(random.nextLong()) % range) + lowerBound;
+		String generatedID = String.format("%0" + generatedIdLength + "d", randomNumber);
+		String verhoeffDigit = ChecksumUtils.generateChecksumDigit(generatedID);
+		return generatedID + verhoeffDigit;
 	}
 
-	/**
-	 * Appends a checksum to generated id
-	 * 
-	 * @param generatedIdLength The length of id
-	 * @param generatedID       The generated id
-	 * @param verhoeffDigit     The checksum to append
-	 * @return uin with checksum
-	 */
-	private String appendChecksum(int generatedIdLength, String generatedID, String verhoeffDigit) {
-		StringBuilder uinStringBuilder = new StringBuilder();
-		uinStringBuilder.setLength(uinLength);
-		return uinStringBuilder.insert(0, generatedID).insert(generatedID.length(), verhoeffDigit).toString().trim();
+	private int insertBatch(EntityManager em, List<UinEntity> batch) {
+		if (batch == null || batch.isEmpty()) return 0;
+
+		// Filter out any UINs that somehow already exist (Bloom false positives can't
+		// cause this, but a concurrent process might have inserted them).
+		List<String> uinStrings = batch.stream().map(UinEntity::getUin).toList();
+		Set<String> existingSet = new HashSet<>(
+				em.createQuery("SELECT u.uin FROM UinEntity u WHERE u.uin IN :uins", String.class)
+						.setParameter("uins", uinStrings)
+						.getResultList());
+
+		List<UinEntity> toInsert = batch.stream()
+				.filter(u -> !existingSet.contains(u.getUin()))
+				.toList();
+
+		if (toInsert.isEmpty()) return 0;
+
+		EntityTransaction tx = em.getTransaction();
+		try {
+			tx.begin();
+			toInsert.forEach(em::persist);
+			em.flush();
+			em.clear();
+			tx.commit();
+			return toInsert.size();
+		} catch (PersistenceException e) {
+			if (tx.isActive()) tx.rollback();
+			LOGGER.warn("Batch insert failed, retrying individually: {}", e.getMessage());
+			return insertIndividually(em, toInsert);
+		}
+	}
+
+	private int insertIndividually(EntityManager em, List<UinEntity> entities) {
+		int inserted = 0;
+		for (UinEntity entity : entities) {
+			EntityTransaction tx = em.getTransaction();
+			try {
+				long exists = em.createQuery("SELECT COUNT(u) FROM UinEntity u WHERE u.uin = :uin", Long.class)
+						.setParameter("uin", entity.getUin())
+						.getSingleResult();
+				if (exists == 0) {
+					tx.begin();
+					em.persist(entity);
+					em.flush();
+					tx.commit();
+					inserted++;
+				}
+			} catch (Exception e) {
+				if (tx.isActive()) tx.rollback();
+				LOGGER.warn("Retry insert failed for UIN: {}", entity.getUin());
+			}
+		}
+		return inserted;
 	}
 
 }

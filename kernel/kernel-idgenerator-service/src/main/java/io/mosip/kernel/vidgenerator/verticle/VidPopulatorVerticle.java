@@ -45,9 +45,13 @@ public class VidPopulatorVerticle extends AbstractVerticle {
 			long noOfFreeVids = Long.parseLong(handler.body().toString());
 			long noOfVidsToGenerate = vidToGenerate - noOfFreeVids;
 			LOGGER.info("Persisting {} vids in pool", noOfVidsToGenerate);
+
+			// Run on a worker thread — never block the Vert.x event loop.
+			// Blocking the event loop delays health-check responses and can trigger
+			// Kubernetes liveness probe failures → pod restart.
 			vertx.executeBlocking(future -> {
 				long count = 0;
-				while (count < vidToGenerate) {
+				while (count < noOfVidsToGenerate) {
 					String vid = vidGenerator.generateId();
 					VidEntity entity = new VidEntity();
 					entity.setVid(vid);
@@ -59,13 +63,13 @@ public class VidPopulatorVerticle extends AbstractVerticle {
 					}
 				}
 				LOGGER.info("No of vids persisted are {}", count);
-				future.complete("pool population successfull");
-			}, false, result -> {
+				future.complete(count);
+			}, result -> {
 				if (result.succeeded()) {
-					handler.reply(result.result());
+					handler.reply("pool population successfull");
 				} else {
 					LOGGER.error("VID pool population failed", result.cause());
-					handler.fail(500, result.cause().getMessage()); // 500 is the error code
+					handler.fail(500, result.cause() != null ? result.cause().getMessage() : "VID generation failed");
 				}
 			});
 		});
